@@ -1,17 +1,23 @@
 "use client";
 
-import { useState, FormEvent, ChangeEvent } from "react";
+import { useState, FormEvent, ChangeEvent, useRef } from "react";
 import { UserFormData } from "@/types/user";
 import axios from "axios";
 import { Loader2 } from "lucide-react";
 
 interface UserFormProps {
   onSuccess: () => void;
+  disabled?: boolean;
 }
 
-export default function UserForm({ onSuccess }: UserFormProps) {
+export default function UserForm({
+  onSuccess,
+  disabled = false,
+}: UserFormProps) {
   const [isLoading, setIsLoading] = useState(false);
   const [showForm, setShowForm] = useState(false);
+  const [analyzer, setAnalyzer] = useState(false);
+  const workerRef = useRef<Worker | null>(null);
   const [formData, setFormData] = useState<UserFormData>({
     name: "",
     email: "",
@@ -42,12 +48,121 @@ export default function UserForm({ onSuccess }: UserFormProps) {
     }));
   };
 
+  const initializeWorker = () => {
+    if (!workerRef.current) {
+      try {
+        workerRef.current = new Worker(
+          new URL("@/workers/prediction.worker", import.meta.url),
+          { type: "module" },
+        );
+      } catch (error) {
+        console.error("Erro ao criar worker:", error);
+        return null;
+      }
+    }
+    return workerRef.current;
+  };
+
+  const predictRisk = (): Promise<number> => {
+    return new Promise((resolve, reject) => {
+      const worker = initializeWorker();
+      if (!worker) {
+        reject(new Error("Não foi possível inicializar o worker"));
+        return;
+      }
+
+      worker.postMessage({
+        type: "INIT",
+        params: { mins: [], maxs: [] },
+      });
+
+      const timeout = setTimeout(() => {
+        reject(new Error("Timeout na predição"));
+      }, 30000);
+
+      const handleMessage = (e: MessageEvent) => {
+        clearTimeout(timeout);
+        worker.removeEventListener("message", handleMessage);
+        worker.removeEventListener("error", handleError);
+
+        if (e.data.type === "RESULT") {
+          resolve(e.data.risk);
+        } else if (e.data.type === "ERROR") {
+          reject(new Error(e.data.message));
+        }
+      };
+
+      const handleError = (error: ErrorEvent) => {
+        clearTimeout(timeout);
+        worker.removeEventListener("message", handleMessage);
+        worker.removeEventListener("error", handleError);
+        reject(error);
+      };
+
+      worker.addEventListener("message", handleMessage);
+      worker.addEventListener("error", handleError);
+
+      // Envia dados para previsão
+      try {
+        worker.postMessage({
+          type: "PREDICT",
+          data: {
+            patient_id: 0, // novo usuário
+            age: formData.age,
+            gender: formData.gender === "M" ? "Male" : "Female",
+            resting_bp: formData.bloodPressure,
+            cholesterol: formData.cholesterol,
+            fasting_bs: formData.glucose,
+            ecg_result: "Normal", // padrão
+            max_heart_rate: 180, // estimativa
+            exercise_angina: formData.physicalActivity > 0 ? "N" : "Y",
+            st_depression: 0, // padrão
+            slope: "Flat", // padrão
+            num_major_vessels: 0, // padrão
+            thalassemia: "Normal", // padrão
+            heart_attack: 0, // desconhecido
+            birthday: "1990-01-01", // padrão
+            visit_per_week: 3, // padrão
+            days_per_week: "Mon, Wed, Fri", // padrão
+            attend_group_lesson: false, // padrão
+            fav_group_lesson: "", // padrão
+            avg_time_check_in: "09:00:00", // padrão
+            avg_time_check_out: "10:00:00", // padrão
+            avg_time_in_gym: 60, // padrão
+            drink_abo: false, // padrão
+            fav_drink: "", // padrão
+            personal_training: false, // padrão
+            name_personal_trainer: "", // padrão
+            uses_sauna: false, // padrão
+          },
+          params: null,
+        });
+      } catch (error) {
+        clearTimeout(timeout);
+        reject(error);
+      }
+    });
+  };
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setIsLoading(true);
+    setAnalyzer(true);
 
     try {
-      const response = await axios.post("/api/users", formData);
+      // Analisando risco via web worker
+      console.log("Iniciando predição via web worker...");
+      const heartAttackRisk = await predictRisk();
+      console.log(`Risco predito: ${heartAttackRisk}%`);
+
+      setAnalyzer(false);
+
+      // POST para API com risco já calculado
+      const response = await axios.post("/api/users", {
+        ...formData,
+        heartAttackRisk,
+      });
+
       if (response.status === 201) {
         alert("Usuário adicionado com sucesso!");
         setFormData({
@@ -70,8 +185,11 @@ export default function UserForm({ onSuccess }: UserFormProps) {
         onSuccess();
       }
     } catch (error) {
-      console.error("Erro ao adicionar usuário:", error);
-      alert("Erro ao adicionar usuário. Verifique os dados e tente novamente.");
+      console.error("Erro:", error);
+      setAnalyzer(false);
+      const errorMsg =
+        error instanceof Error ? error.message : "Erro desconhecido";
+      alert(`Erro: ${errorMsg}`);
     } finally {
       setIsLoading(false);
     }
@@ -81,7 +199,8 @@ export default function UserForm({ onSuccess }: UserFormProps) {
     return (
       <button
         onClick={() => setShowForm(true)}
-        className="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-lg transition-colors mb-6"
+        disabled={disabled}
+        className="w-full bg-green-600 hover:bg-green-700 disabled:bg-gray-400 text-white font-bold py-3 px-4 rounded-lg transition-colors mb-6"
       >
         + Adicionar Novo Usuário
       </button>
@@ -101,6 +220,13 @@ export default function UserForm({ onSuccess }: UserFormProps) {
         </button>
       </div>
 
+      {analyzer && (
+        <div className="mb-6 p-4 bg-blue-50 border border-blue-200 rounded-lg flex items-center gap-3">
+          <Loader2 className="w-5 h-5 animate-spin text-blue-600" />
+          <span className="text-blue-700 font-medium">Analisando risco...</span>
+        </div>
+      )}
+
       <form onSubmit={handleSubmit} className="space-y-6">
         {/* Seção de Dados Pessoais */}
         <div>
@@ -118,7 +244,8 @@ export default function UserForm({ onSuccess }: UserFormProps) {
                 value={formData.name}
                 onChange={handleChange}
                 required
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                disabled={isLoading}
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
                 placeholder="João Silva"
               />
             </div>
@@ -133,7 +260,8 @@ export default function UserForm({ onSuccess }: UserFormProps) {
                 value={formData.email}
                 onChange={handleChange}
                 required
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                disabled={isLoading}
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
                 placeholder="joao@example.com"
               />
             </div>
@@ -147,7 +275,8 @@ export default function UserForm({ onSuccess }: UserFormProps) {
                 name="phone"
                 value={formData.phone}
                 onChange={handleChange}
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                disabled={isLoading}
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
                 placeholder="(11) 98765-4321"
               />
             </div>
@@ -160,7 +289,8 @@ export default function UserForm({ onSuccess }: UserFormProps) {
                 name="gender"
                 value={formData.gender}
                 onChange={handleChange}
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                disabled={isLoading}
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
               >
                 <option value="M">Masculino</option>
                 <option value="F">Feminino</option>
@@ -177,9 +307,10 @@ export default function UserForm({ onSuccess }: UserFormProps) {
                 value={formData.age}
                 onChange={handleChange}
                 required
+                disabled={isLoading}
                 min="18"
                 max="120"
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
               />
             </div>
 
@@ -193,8 +324,9 @@ export default function UserForm({ onSuccess }: UserFormProps) {
                 value={formData.bmi}
                 onChange={handleChange}
                 required
+                disabled={isLoading}
                 step="0.1"
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
               />
             </div>
           </div>
@@ -216,7 +348,8 @@ export default function UserForm({ onSuccess }: UserFormProps) {
                 value={formData.bloodPressure}
                 onChange={handleChange}
                 required
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                disabled={isLoading}
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
               />
             </div>
 
@@ -230,7 +363,8 @@ export default function UserForm({ onSuccess }: UserFormProps) {
                 value={formData.cholesterol}
                 onChange={handleChange}
                 required
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                disabled={isLoading}
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
               />
             </div>
 
@@ -244,7 +378,8 @@ export default function UserForm({ onSuccess }: UserFormProps) {
                 value={formData.glucose}
                 onChange={handleChange}
                 required
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                disabled={isLoading}
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
               />
             </div>
 
@@ -254,7 +389,8 @@ export default function UserForm({ onSuccess }: UserFormProps) {
                 name="smoker"
                 checked={formData.smoker}
                 onChange={handleChange}
-                className="w-4 h-4 text-blue-600 rounded"
+                disabled={isLoading}
+                className="w-4 h-4 text-blue-600 rounded disabled:bg-gray-100"
               />
               <label className="ml-2 text-sm font-medium text-gray-700">
                 Fumante?
@@ -267,7 +403,8 @@ export default function UserForm({ onSuccess }: UserFormProps) {
                 name="family_history"
                 checked={formData.family_history}
                 onChange={handleChange}
-                className="w-4 h-4 text-blue-600 rounded"
+                disabled={isLoading}
+                className="w-4 h-4 text-blue-600 rounded disabled:bg-gray-100"
               />
               <label className="ml-2 text-sm font-medium text-gray-700">
                 Histórico Familiar de Infarto?
@@ -292,9 +429,10 @@ export default function UserForm({ onSuccess }: UserFormProps) {
                 value={formData.physicalActivity}
                 onChange={handleChange}
                 required
+                disabled={isLoading}
                 step="0.5"
                 min="0"
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
               />
             </div>
 
@@ -308,9 +446,10 @@ export default function UserForm({ onSuccess }: UserFormProps) {
                 value={formData.alcohol_consumption}
                 onChange={handleChange}
                 required
+                disabled={isLoading}
                 step="0.5"
                 min="0"
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
               />
             </div>
 
@@ -324,9 +463,10 @@ export default function UserForm({ onSuccess }: UserFormProps) {
                 value={formData.stress_level}
                 onChange={handleChange}
                 required
+                disabled={isLoading}
                 min="1"
                 max="10"
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
               />
             </div>
           </div>
@@ -344,7 +484,8 @@ export default function UserForm({ onSuccess }: UserFormProps) {
           <button
             type="button"
             onClick={() => setShowForm(false)}
-            className="flex-1 bg-gray-600 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded-lg transition-colors"
+            disabled={isLoading}
+            className="flex-1 bg-gray-600 hover:bg-gray-700 disabled:bg-gray-400 text-white font-bold py-2 px-4 rounded-lg transition-colors"
           >
             Cancelar
           </button>
